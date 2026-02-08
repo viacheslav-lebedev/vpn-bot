@@ -1,562 +1,468 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-import keyboards
 import database
-import config
-import payments
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
-import uuid
+from sqlalchemy.exc import SQLAlchemyError
+import payments
+import outlines_api
+import config
+import keyboards
 import logging
-from typing import Dict
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-# Хранилище для временных данных
-user_sessions: Dict[int, Dict] = {}
-admin_sessions: Dict[int, Dict] = {}
-
-# ============ БАЗОВЫЕ КОМАНДЫ ============
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    user = update.effective_user
+    
+    # Регистрируем пользователя
     db = database.SessionLocal()
     try:
-        user_id = update.effective_user.id
-        user = db.query(database.User).filter_by(telegram_id=user_id).first()
-        
-        if not user:
-            user = database.User(
-                telegram_id=user_id,
-                username=update.effective_user.username,
-                full_name=update.effective_user.full_name,
-                created_at=datetime.utcnow()
+        existing = db.query(database.User).filter_by(telegram_id=user.id).first()
+        if not existing:
+            new_user = database.User(
+                telegram_id=user.id,
+                username=user.username,
+                full_name=user.full_name,
+                balance=0.0
             )
-            db.add(user)
+            db.add(new_user)
             db.commit()
-        
-        is_admin = (user_id == config.Config.ADMIN_ID)
-        
-        if update.message:
-            await update.message.reply_text(
-                "👋 VPN Бот\nВыберите действие:",
-                reply_markup=keyboards.main_menu(is_admin=is_admin)
-            )
-            
+            logger.info(f"Новый пользователь: {user.id}")
     except Exception as e:
-        print(f"Ошибка в start: {e}")
+        logger.error(f"Ошибка регистрации: {e}")
+        db.rollback()
     finally:
         db.close()
+    
+    await update.message.reply_text(
+        text=f"Привет, {user.first_name}! 👋\n\n"
+             "Я бот для управления VPN на базе Outline.\n"
+             "Выберите действие:",
+        reply_markup=keyboards.main_menu()
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_admin = (update.effective_user.id == config.Config.ADMIN_ID)
+    """Команда /help"""
     await update.message.reply_text(
-        "🤖 VPN Бот - Помощь\nИспользуйте кнопки меню",
-        reply_markup=keyboards.main_menu(is_admin=is_admin)
+        text="🤖 Доступные команды:\n"
+             "/start - Главное меню\n"
+             "/help - Эта справка\n"
+             "/balance - Проверить баланс\n"
+             "/admin - Панель администратора (если вы админ)\n\n"
+             "Используйте кнопки для навигации."
     )
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /balance"""
     db = database.SessionLocal()
     try:
-        user_id = update.effective_user.id
-        user = db.query(database.User).filter_by(telegram_id=user_id).first()
-        
+        user = db.query(database.User).filter_by(telegram_id=update.effective_user.id).first()
         if user:
-            is_admin = (user_id == config.Config.ADMIN_ID)
-            await update.message.reply_text(
-                f"💰 Ваш баланс: {user.balance}₽",
-                reply_markup=keyboards.main_menu(is_admin=is_admin)
-            )
+            await update.message.reply_text(f"💰 Ваш баланс: {user.balance} руб.")
         else:
-            is_admin = (user_id == config.Config.ADMIN_ID)
-            await update.message.reply_text(
-                "Вы не зарегистрированы",
-                reply_markup=keyboards.main_menu(is_admin=is_admin)
-            )
+            await update.message.reply_text("❌ Пользователь не найден. Используйте /start")
     finally:
         db.close()
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /admin - только для администратора"""
     user_id = update.effective_user.id
+    
     if user_id != config.Config.ADMIN_ID:
-        await update.message.reply_text("⛔ Доступ запрещен")
+        await update.message.reply_text("❌ У вас нет прав администратора.")
         return
     
     await update.message.reply_text(
-        "👑 Панель администратора",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💰 Управление балансами", callback_data="admin_balance")],
-            [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-            [InlineKeyboardButton("◀️ В главное меню", callback_data="main_menu")]
-        ])
+        text="👑 Панель администратора",
+        reply_markup=keyboards.admin_keyboard()
     )
-
-# ============ ОБРАБОТЧИК КНОПОК ============
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик всех inline-кнопок"""
     query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
     
-    print(f"Кнопка нажата: {data} пользователем {user_id}")
+    # Всегда отвечаем на callback_query
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Не удалось ответить на callback_query: {e}")
+        # Продолжаем выполнение
     
-    # Главное меню
-    if data == "main_menu":
-        is_admin = (user_id == config.Config.ADMIN_ID)
+    user_id = update.effective_user.id
+    callback_data = query.data
+    
+    logger.info(f"Кнопка: {callback_data} от {user_id}")
+    
+    # РОУТИНГ ПО CALLBACK_DATA
+    if callback_data == "main_menu":
+        await show_main_menu(query)
+    
+    elif callback_data == "show_tariffs":
+        await show_tariffs(query)
+    
+    elif callback_data.startswith("tariff_"):
+        tariff_id = callback_data.replace("tariff_", "")
+        await handle_tariff_selection(query, user_id, tariff_id)
+    
+    elif callback_data.startswith("pay_"):
+        tariff_id = callback_data.replace("pay_", "")
+        await handle_payment(query, user_id, tariff_id)
+    
+    elif callback_data == "my_keys":
+        await show_user_keys(query, user_id)
+    
+    elif callback_data == "balance":
+        await show_balance(query, user_id)
+    
+    elif callback_data == "support":
+        await show_support(query)
+    
+    # АДМИН КНОПКИ
+    elif callback_data == "admin_stats":
+        await admin_stats(query, user_id)
+    
+    elif callback_data == "admin_users":
+        await admin_users(query, user_id)
+    
+    elif callback_data == "admin_keys":
+        await admin_keys(query, user_id)
+    
+    elif callback_data == "admin_payments":
+        await admin_payments(query, user_id)
+    
+    else:
         await query.edit_message_text(
-            "👋 Главное меню",
-            reply_markup=keyboards.main_menu(is_admin=is_admin)
+            text="❌ Неизвестная команда",
+            reply_markup=keyboards.main_menu()
         )
-        return
-    
-    # Баланс
-    if data == "balance_info":
-        db = database.SessionLocal()
-        try:
-            user = db.query(database.User).filter_by(telegram_id=user_id).first()
-            if user:
-                is_admin = (user_id == config.Config.ADMIN_ID)
-                await query.edit_message_text(
-                    f"💰 Ваш баланс: {user.balance}₽",
-                    reply_markup=keyboards.main_menu(is_admin=is_admin)
-                )
-        finally:
-            db.close()
-        return
-    
-    # Пополнение баланса
-    if data == "balance_deposit":
-        await query.edit_message_text(
-            "💰 Выберите сумму пополнения:",
-            reply_markup=keyboards.deposit_amounts_keyboard()
-        )
-        return
-    
-    # Суммы пополнения
-    if data.startswith("deposit_"):
-        try:
-            amount = float(data.replace("deposit_", ""))
-            await handle_payment(update, context, amount)
-        except ValueError:
-            await query.edit_message_text(
-                "❌ Ошибка: неверная сумма",
-                reply_markup=keyboards.back_to_main()
-            )
-        return
-    
-    # Админ панель
-    if data == "admin_panel":
-        if user_id != config.Config.ADMIN_ID:
-            await query.answer("⛔ Доступ запрещен", show_alert=True)
-            return
-        
-        await query.edit_message_text(
-            "👑 Панель администратора",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💰 Управление балансами", callback_data="admin_balance")],
-                [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
-                [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-                [InlineKeyboardButton("◀️ В главное меню", callback_data="main_menu")]
-            ])
-        )
-        return
-    
-    # Купить тариф
-    if data == "buy_tariff":
-        db = database.SessionLocal()
-        try:
-            user = db.query(database.User).filter_by(telegram_id=user_id).first()
-            if user:
-                await query.edit_message_text(
-                    "🛒 Выберите тариф:",
-                    reply_markup=keyboards.tariffs_keyboard(user.trial_used)
-                )
-        finally:
-            db.close()
-        return
-    
-    # Выбор тарифа
-    if data.startswith("tariff_"):
-        tariff_id = data.replace("tariff_", "")
-        
-        if tariff_id not in config.Config.TARIFFS:
-            await query.edit_message_text("❌ Тариф не найден")
-            return
-        
-        tariff = config.Config.TARIFFS[tariff_id]
-        
-        db = database.SessionLocal()
-        try:
-            user = db.query(database.User).filter_by(telegram_id=user_id).first()
-            
-            if not user:
-                await query.edit_message_text("❌ Пользователь не найден")
-                return
-            
-            # Проверка пробного тарифа
-            if tariff_id == "trial" and user.trial_used:
-                await query.edit_message_text(
-                    "❌ Вы уже использовали пробный период!",
-                    reply_markup=keyboards.back_to_main()
-                )
-                return
-            
-            # Если бесплатный - сразу активируем
-            if tariff["price"] == 0:
-                await activate_tariff(update, context, user_id, tariff_id)
-                return
-            
-            # Если платный - проверяем баланс
-            if user.balance < tariff["price"]:
-                await query.edit_message_text(
-                    f"❌ Недостаточно средств!\n\n"
-                    f"Нужно: {tariff['price']}₽\n"
-                    f"Ваш баланс: {user.balance}₽\n\n"
-                    f"Пополните баланс.",
-                    reply_markup=keyboards.back_to_main()
-                )
-                return
-            
-            # Активируем тариф
-            await activate_tariff(update, context, user_id, tariff_id)
-            
-        finally:
-            db.close()
-        return
-    
-    # Мои ключи
-    if data == "my_keys":
-        await show_user_keys(update, context, user_id)
-        return
-    
-    # Обработка других кнопок
+# ========== ОСНОВНЫЕ ФУНКЦИИ ==========
+
+async def show_main_menu(query):
+    """Показать главное меню"""
     await query.edit_message_text(
-        f"Кнопка: {data}",
-        reply_markup=keyboards.back_to_main()
+        text="Главное меню:",
+        reply_markup=keyboards.main_menu()
     )
 
-# ============ ФУНКЦИИ ДЛЯ ПЛАТЕЖЕЙ И ТАРИФОВ ============
+async def show_tariffs(query):
+    """Показать тарифы"""
+    await query.edit_message_text(
+        text="Выберите тариф:",
+        reply_markup=keyboards.tariffs_keyboard()
+    )
 
-async def activate_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, tariff_id: str):
-    """Активировать тариф с реальными ключами"""
+async def handle_tariff_selection(query, user_id, tariff_id):
+    """Обработка выбора тарифа"""
+    tariff = config.Config.TARIFFS.get(tariff_id)
+    
+    if not tariff:
+        await query.edit_message_text(
+            text="❌ Тариф не найден.",
+            reply_markup=keyboards.tariffs_keyboard()
+        )
+        return
+    
+    if tariff_id == "trial":
+        # Пробный период
+        await handle_trial_period(query, user_id)
+    else:
+        # Платный тариф
+        await query.edit_message_text(
+            text=f"📋 Тариф: {tariff['name']}\n"
+                 f"💰 Цена: {tariff['price']} руб.\n"
+                 f"⏳ Срок: {tariff['days']} дней\n\n"
+                 f"Для оплаты нажмите кнопку ниже:",
+            reply_markup=keyboards.payment_keyboard(tariff_id)
+        )
+
+async def handle_trial_period(query, user_id):
+    """Обработка пробного периода"""
     db = database.SessionLocal()
     try:
         user = db.query(database.User).filter_by(telegram_id=user_id).first()
-        
         if not user:
-            await update.callback_query.edit_message_text("❌ Пользователь не найден")
+            await query.edit_message_text("❌ Пользователь не найден")
             return
         
-        if tariff_id not in config.Config.TARIFFS:
-            await update.callback_query.edit_message_text("❌ Тариф не найден")
-            return
-        
-        tariff = config.Config.TARIFFS[tariff_id]
-        
-        # Проверка пробного тарифа
-        if tariff_id == "trial" and user.trial_used:
-            await update.callback_query.edit_message_text(
-                "❌ Вы уже использовали пробный период!",
-                reply_markup=keyboards.back_to_main()
+        if user.trial_used:
+            await query.edit_message_text(
+                text="❌ Пробный период уже использован.",
+                reply_markup=keyboards.main_menu()
             )
             return
         
-        # Для платных тарифов списываем баланс
-        if tariff["price"] > 0:
-            if user.balance < tariff["price"]:
-                await update.callback_query.edit_message_text(
-                    f"❌ Недостаточно средств: {tariff['price']}₽",
-                    reply_markup=keyboards.back_to_main()
-                )
-                return
-            user.balance -= tariff["price"]
+        # Создаем VPN ключ
+        api = outlines_api.OutlinesAPI()
+        key_name = f"Пробный {user.telegram_id}"
+        new_key = api.create_key(key_name, limit_gb=5)
         
-        # Отмечаем пробный тариф
-        if tariff_id == "trial":
+        if new_key:
+            # Сохраняем ключ в БД
+            vpn_key = database.VPNKey(
+                user_id=user.id,
+                key_id=new_key.get('id'),
+                name=key_name,
+                access_url=new_key.get('accessUrl', ''),
+                server_id=config.Config.OUTLINES_SERVER_ID,
+                data_limit_gb=5
+            )
+            db.add(vpn_key)
+            
+            # Создаем подписку
+            subscription = database.Subscription(
+                user_id=user.id,
+                tariff_id="trial",
+                start_date=datetime.utcnow(),
+                end_date=datetime.utcnow() + timedelta(days=30),
+                is_active=True,
+                vpn_key_id=vpn_key.id
+            )
+            db.add(subscription)
+            
+            # Отмечаем пробный период как использованный
             user.trial_used = True
-        
-        # СОЗДАЕМ КЛЮЧ В OUTLINE
-        limit_gb = tariff.get("limit_gb", 10)
-        key_name = f"{user.full_name or user.username or str(user_id)} - {tariff['name']}"
-        
-        # Импортируем outlines_api внутри функции для правильной работы
-        try:
-            import outlines_api
-            # Используем API правильно
-            outlines_api_instance = outlines_api.OutlinesAPI()
-            key_data = outlines_api_instance.create_key(key_name, limit_gb)
-            print(f"Outline API ответ: {key_data}")
-        except Exception as e:
-            print(f"Ошибка Outline API: {e}")
-            key_data = None
-        
-        if key_data and 'accessUrl' in key_data:
-            # УСПЕХ: реальный ключ создан
-            vpn_key = database.VPNKey(
-                user_id=user.id,
-                key_id=key_data.get('id', str(uuid.uuid4())),
-                key=key_data['accessUrl'],
-                name=key_name,
-                data_limit=limit_gb * 1024**3,
-                created_at=datetime.utcnow(),
-                is_active=True
+            
+            db.commit()
+            
+            # Отправляем ключ пользователю
+            await query.edit_message_text(
+                text=f"✅ Пробный период активирован на 30 дней!\n\n"
+                     f"🔑 Ваш VPN ключ:\n"
+                     f"`{new_key.get('accessUrl', '')}`\n\n"
+                     f"📱 Используйте любой Shadowsocks клиент для подключения.",
+                parse_mode="Markdown",
+                reply_markup=keyboards.main_menu()
             )
-            actual_key = key_data['accessUrl']
-            key_source = "✅ Реальный Outline ключ"
+            logger.info(f"Пробный период активирован для {user_id}")
         else:
-            # Если Outline не работает, создаем реалистичный тестовый ключ
-            print("⚠️ Outline не отвечает, создаю реалистичный ключ")
-            
-            # Создаем реалистичный ключ в формате ss://
-            import base64
-            import json
-            
-            # Создаем конфигурацию
-            config_data = {
-                "server": "45.135.182.168",
-                "server_port": 443,
-                "password": f"outline_{user_id}_{tariff_id}_{uuid.uuid4().hex[:8]}",
-                "method": "chacha20-ietf-poly1305"
-            }
-            
-            # Кодируем
-            config_str = f"{config_data['method']}:{config_data['password']}@{config_data['server']}:{config_data['server_port']}"
-            config_b64 = base64.b64encode(config_str.encode()).decode()
-            
-            # Формат: ss://base64@server:port?outline=1
-            test_key = f"ss://{config_b64}@{config_data['server']}:{config_data['server_port']}/?outline=1"
-            
-            vpn_key = database.VPNKey(
-                user_id=user.id,
-                key_id=str(uuid.uuid4()),
-                key=test_key,
-                name=key_name,
-                data_limit=limit_gb * 1024**3,
-                created_at=datetime.utcnow(),
-                is_active=True
+            await query.edit_message_text(
+                text="❌ Не удалось создать VPN ключ. Попробуйте позже.",
+                reply_markup=keyboards.main_menu()
             )
-            actual_key = test_key
-            key_source = "⚠️ Тестовый ключ (Outline временно недоступен)"
-        
-        db.add(vpn_key)
-        
-        # Создаем подписку
-        end_date = datetime.utcnow() + timedelta(days=tariff['days'])
-        subscription = database.Subscription(
-            user_id=user.id,
-            tariff=tariff_id,
-            price=tariff["price"],
-            start_date=datetime.utcnow(),
-            end_date=end_date,
-            is_active=True
-        )
-        db.add(subscription)
-        
-        db.commit()
-        
-        # Форматируем ключ для отображения
-        display_key = actual_key
-        if len(display_key) > 60:
-            display_key = f"{actual_key[:60]}..."
-        
-        # Сообщение об успехе
-        success_text = f"""
-✅ *Тариф успешно активирован!*
-
-📋 *Детали тарифа:*
-• Название: {tariff['name']}
-• Срок: {tariff['days']} дней
-• Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}
-• Лимит трафика: {limit_gb} ГБ
-• Стоимость: {tariff['price']}₽
-• Остаток баланса: {user.balance}₽
-• {key_source}
-
-🔑 *Ваш VPN ключ:*
-`{display_key}`
-
-📱 *Инструкция по подключению:*
-1. Скачайте *Outline Client* с outline.org
-2. Нажмите *"Добавить сервер"*
-3. Вставьте ключ выше
-4. Нажмите *"Подключиться"*
-
-💬 *Проблемы с подключением?*
-Напишите в техподдержку: @IdazaneRenn
-
-⚠️ *Сохраните ключ в надежном месте!*
-"""
-        
-        await update.callback_query.edit_message_text(
-            success_text,
-            parse_mode='Markdown',
-            reply_markup=keyboards.back_to_main()
-        )
-        
+            
     except Exception as e:
-        print(f"Ошибка активации тарифа: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        await update.callback_query.edit_message_text(
-            f"❌ Ошибка активации тарифа\n\nПопробуйте позже или обратитесь в поддержку: @IdazaneRenn",
-            reply_markup=keyboards.back_to_main()
+        logger.error(f"Ошибка пробного периода: {e}")
+        await query.edit_message_text(
+            text="❌ Произошла ошибка. Попробуйте позже.",
+            reply_markup=keyboards.main_menu()
         )
         db.rollback()
     finally:
         db.close()
 
-async def show_user_keys(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+async def handle_payment(query, user_id, tariff_id):
+    """Обработка оплаты"""
+    tariff = config.Config.TARIFFS.get(tariff_id)
+    
+    if not tariff:
+        await query.edit_message_text("❌ Тариф не найден")
+        return
+    
+    db = database.SessionLocal()
+    try:
+        user = db.query(database.User).filter_by(telegram_id=user_id).first()
+        if not user:
+            await query.edit_message_text("❌ Пользователь не найден")
+            return
+        
+        # Создаем платеж
+        description = f"Тариф: {tariff['name']} ({tariff['days']} дней)"
+        payment_result = payments.create_payment(
+            user_id=user.id,
+            amount=tariff['price'],
+            description=description,
+            tariff_id=tariff_id
+        )
+        
+        if payment_result:
+            await query.edit_message_text(
+                text=f"💳 Для оплаты перейдите по ссылке:\n\n"
+                     f"{payment_result['confirmation_url']}\n\n"
+                     f"После оплаты баланс пополнится автоматически.",
+                reply_markup=keyboards.main_menu()
+            )
+        else:
+            await query.edit_message_text(
+                text="❌ Не удалось создать платеж. Попробуйте позже.",
+                reply_markup=keyboards.main_menu()
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания платежа: {e}")
+        await query.edit_message_text(
+            text="❌ Произошла ошибка при создании платежа.",
+            reply_markup=keyboards.main_menu()
+        )
+    finally:
+        db.close()
+
+async def show_user_keys(query, user_id):
     """Показать ключи пользователя"""
     db = database.SessionLocal()
     try:
         user = db.query(database.User).filter_by(telegram_id=user_id).first()
-        
         if not user:
-            await update.callback_query.edit_message_text("Пользователь не найден")
+            await query.edit_message_text("❌ Пользователь не найден")
             return
         
-        keys = db.query(database.VPNKey).filter_by(user_id=user.id, is_active=True).all()
+        keys = db.query(database.VPNKey).filter_by(user_id=user.id).all()
         
         if not keys:
-            await update.callback_query.edit_message_text(
-                "🔑 У вас нет активных VPN ключей\n\nКупите тариф.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🛒 Купить тариф", callback_data="buy_tariff")],
-                    [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-                ])
+            await query.edit_message_text(
+                text="У вас пока нет VPN ключей.",
+                reply_markup=keyboards.main_menu()
             )
             return
         
-        keys_text = "🔑 *Ваши VPN ключи:*\n\n"
+        text = "🔑 Ваши VPN ключи:\n\n"
+        for key in keys:
+            text += f"• {key.name}\n"
+            if key.access_url:
+                text += f"  `{key.access_url[:50]}...`\n\n"
         
-        for i, key in enumerate(keys, 1):
-            keys_text += f"{i}. *{key.name}*\n"
-            # Обрезаем длинный ключ
-            display_key = key.key
-            if len(display_key) > 40:
-                display_key = f"{key.key[:40]}..."
-            keys_text += f"   Ключ: `{display_key}`\n\n"
-        
-        keys_text += "\n📱 *Как подключиться:*\n"
-        keys_text += "1. Скачайте Outline Client\n"
-        keys_text += "2. Добавьте сервер через ключ\n"
-        keys_text += "3. Подключитесь!\n\n"
-        keys_text += "💬 *Помощь:* @IdazaneRenn"
-        
-        await update.callback_query.edit_message_text(
-            keys_text,
-            parse_mode='Markdown',
-            reply_markup=keyboards.back_to_main()
+        await query.edit_message_text(
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=keyboards.main_menu()
         )
         
-    except Exception as e:
-        print(f"Ошибка отображения ключей: {e}")
-        await update.callback_query.edit_message_text(
-            "Ошибка загрузки ключей",
-            reply_markup=keyboards.back_to_main()
-        )
     finally:
         db.close()
 
-async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: float):
-    """Обработка платежа"""
+async def show_balance(query, user_id):
+    """Показать баланс"""
     db = database.SessionLocal()
     try:
-        user_id = update.callback_query.from_user.id
         user = db.query(database.User).filter_by(telegram_id=user_id).first()
-        
-        if not user:
-            await update.callback_query.edit_message_text("❌ Пользователь не найден")
-            return
-        
-        payment_result = await payments.create_payment(db, user_id, amount)
-        
-        if not payment_result:
-            await update.callback_query.edit_message_text(
-                "❌ Не удалось создать платеж",
-                reply_markup=keyboards.back_to_main()
-            )
-            return
-        
-        if payment_result['status'] == 'succeeded':
-            success_text = f"✅ Платеж успешен! +{amount}₽\n💰 Баланс: {user.balance}₽"
-            await update.callback_query.edit_message_text(
-                success_text,
-                reply_markup=keyboards.back_to_main()
+        if user:
+            await query.edit_message_text(
+                text=f"💰 Ваш баланс: {user.balance} руб.",
+                reply_markup=keyboards.main_menu()
             )
         else:
-            payment_text = f"""
-💰 *Оплата {amount}₽*
-
-🌐 Ссылка для оплаты:
-{payment_result['payment_url']}
-
-📝 *После оплаты:*
-1. Закройте страницу оплаты
-2. Вернитесь в бота
-3. Нажмите "Проверить оплату"
-
-ID платежа: `{payment_result['payment_id']}`
-"""
-            
-            keyboard = [
-                [InlineKeyboardButton("🌐 Перейти к оплате", url=payment_result['payment_url'])],
-                [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{payment_result['payment_id']}")],
-                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-            ]
-            
-            await update.callback_query.edit_message_text(
-                payment_text,
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                text="❌ Пользователь не найден",
+                reply_markup=keyboards.main_menu()
             )
-            
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        await update.callback_query.edit_message_text(
-            "❌ Ошибка",
-            reply_markup=keyboards.back_to_main()
+    finally:
+        db.close()
+
+async def show_support(query):
+    """Показать поддержку"""
+    await query.edit_message_text(
+        text="📞 Поддержка:\n\n"
+             "По всем вопросам обращайтесь к администратору.\n"
+             "Мы всегда готовы помочь!",
+        reply_markup=keyboards.main_menu()
+    )
+# ========== АДМИН ФУНКЦИИ ==========
+
+async def admin_stats(query, user_id):
+    """Статистика для администратора"""
+    if user_id != config.Config.ADMIN_ID:
+        await query.edit_message_text("❌ Нет прав")
+        return
+    
+    db = database.SessionLocal()
+    try:
+        users_count = db.query(database.User).count()
+        payments_count = db.query(database.Payment).count()
+        keys_count = db.query(database.VPNKey).count()
+        active_subs = db.query(database.Subscription).filter_by(is_active=True).count()
+        
+        text = f"📊 Статистика:\n\n"
+        text += f"👥 Пользователей: {users_count}\n"
+        text += f"💳 Платежей: {payments_count}\n"
+        text += f"🔑 VPN ключей: {keys_count}\n"
+        text += f"✅ Активных подписок: {active_subs}\n"
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=keyboards.admin_keyboard()
         )
+        
+    finally:
+        db.close()
+
+async def admin_users(query, user_id):
+    """Список пользователей для администратора"""
+    if user_id != config.Config.ADMIN_ID:
+        await query.edit_message_text("❌ Нет прав")
+        return
+    
+    db = database.SessionLocal()
+    try:
+        users = db.query(database.User).order_by(database.User.created_at.desc()).limit(10).all()
+        
+        text = "👥 Последние 10 пользователей:\n\n"
+        for user in users:
+            text += f"• ID: {user.telegram_id}\n"
+            text += f"  Имя: {user.full_name or 'N/A'}\n"
+            text += f"  Баланс: {user.balance} руб.\n"
+            text += f"  Регистрация: {user.created_at.strftime('%Y-%m-%d')}\n\n"
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=keyboards.admin_keyboard()
+        )
+        
+    finally:
+        db.close()
+
+async def admin_keys(query, user_id):
+    """Список ключей для администратора"""
+    if user_id != config.Config.ADMIN_ID:
+        await query.edit_message_text("❌ Нет прав")
+        return
+    
+    db = database.SessionLocal()
+    try:
+        keys = db.query(database.VPNKey).order_by(database.VPNKey.created_at.desc()).limit(10).all()
+        
+        text = "🔑 Последние 10 VPN ключей:\n\n"
+        for key in keys:
+            text += f"• {key.name}\n"
+            text += f"  Пользователь ID: {key.user_id}\n"
+            text += f"  Создан: {key.created_at.strftime('%Y-%m-%d')}\n\n"
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=keyboards.admin_keyboard()
+        )
+        
+    finally:
+        db.close()
+
+async def admin_payments(query, user_id):
+    """Список платежей для администратора"""
+    if user_id != config.Config.ADMIN_ID:
+        await query.edit_message_text("❌ Нет прав")
+        return
+    
+    db = database.SessionLocal()
+    try:
+        payments_list = db.query(database.Payment).order_by(database.Payment.created_at.desc()).limit(10).all()
+        
+        text = "💳 Последние 10 платежей:\n\n"
+        for payment in payments_list:
+            status_emoji = "✅" if payment.status == "completed" else "⏳" if payment.status == "pending" else "❌"
+            text += f"{status_emoji} {payment.amount} руб.\n"
+            text += f"  Статус: {payment.status}\n"
+            text += f"  Дата: {payment.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=keyboards.admin_keyboard()
+        )
+        
     finally:
         db.close()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений"""
-    user_id = update.effective_user.id
-    
-    # Проверяем платежи
-    db = database.SessionLocal()
-    try:
-        user = db.query(database.User).filter_by(telegram_id=user_id).first()
-        
-        if not user:
-            # Регистрируем нового пользователя
-            user = database.User(
-                telegram_id=user_id,
-                username=update.effective_user.username,
-                full_name=update.effective_user.full_name,
-                created_at=datetime.utcnow()
-            )
-            db.add(user)
-            db.commit()
-            
-            welcome_text = "👋 *Добро пожаловать!*\n\nВы зарегистрированы в VPN боте."
-            is_admin = (user_id == config.Config.ADMIN_ID)
-            await update.message.reply_text(
-                welcome_text,
-                parse_mode='Markdown',
-                reply_markup=keyboards.main_menu(is_admin=is_admin)
-            )
-            return
-        
-        # Обычное сообщение
-        is_admin = (user_id == config.Config.ADMIN_ID)
-        await update.message.reply_text(
-            "Используйте кнопки меню или команду /start",
-            reply_markup=keyboards.main_menu(is_admin=is_admin)
-        )
-        
-    finally:
-        db.close()
+    """Обработчик текстовых сообщений"""
+    await update.message.reply_text(
+        text="Используйте команды или кнопки меню.\n"
+             "/start - главное меню"
+    )
